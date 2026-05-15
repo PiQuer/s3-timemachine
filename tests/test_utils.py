@@ -2,8 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from s3_timemachine.utils import (
     parse_datetime,
     parse_iso,
@@ -139,7 +137,12 @@ class TestParseLockTags:
 
 
 class TestSelectLockTimeForTarget:
-    def setup_method(self):
+    t1: datetime
+    t2: datetime
+    t3: datetime
+    lock_times: list[datetime]
+
+    def setup_method(self) -> None:
         self.t1 = datetime(2025, 1, 1, tzinfo=timezone.utc)
         self.t2 = datetime(2026, 1, 1, tzinfo=timezone.utc)
         self.t3 = datetime(2027, 1, 1, tzinfo=timezone.utc)

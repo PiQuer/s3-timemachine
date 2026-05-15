@@ -1,7 +1,7 @@
 """Tests for main S3 TimeMachine functionality."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -276,6 +276,7 @@ def test_copy_versions_to_destination(mock_s3_client):
         Bucket="dst",
         Key="k",
         CopySource={"Bucket": "src", "Key": "k", "VersionId": "v"},
+        Config=ANY,
     )
 
 

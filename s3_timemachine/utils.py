@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any
 
 LOCK_TAG_KEY_PREFIX = "LockTime"
 LOCK_TAG_VALUE_RE = re.compile(r"^\s*Locked until\s+(?P<ts>\S+)\s*$")
@@ -42,7 +43,7 @@ def parse_iso(value: str) -> datetime | None:
 
 
 def parse_lock_tags(
-    tags: Iterable[dict], now: datetime | None = None
+    tags: Iterable[Mapping[str, Any]], now: datetime | None = None
 ) -> list[datetime]:
     """Extract non-expired lock times from a bucket tag set.
 
@@ -68,8 +69,8 @@ def parse_lock_tags(
 
     found: set[datetime] = set()
     for tag in tags:
-        key = tag.get("Key", "")
-        value = tag.get("Value", "")
+        key = str(tag.get("Key", ""))
+        value = str(tag.get("Value", ""))
         if not key.startswith(LOCK_TAG_KEY_PREFIX):
             continue
         # Parse the expiry from the value — used only for filtering.

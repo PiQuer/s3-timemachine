@@ -3,22 +3,43 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import boto3
+import boto3.s3.transfer
+import botocore.config
+import botocore.exceptions
 
 from .utils import parse_iso, parse_lock_tags, select_lock_time_for_target
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.client import S3Client
+    from mypy_boto3_s3.service_resource import S3ServiceResource
+    from mypy_boto3_s3.type_defs import (
+        DeleteMarkerEntryTypeDef,
+        ObjectVersionTypeDef,
+        TagTypeDef,
+    )
 
 logger = logging.getLogger("s3_timemachine")
 
 RestoreTier = Literal["Standard", "Bulk", "Expedited"]
 
-# Storage classes that require a restore request before the object is readable.
-ARCHIVE_STORAGE_CLASSES = {"GLACIER", "DEEP_ARCHIVE"}
+#: Storage classes that require a restore request before the object is readable.
+ARCHIVE_STORAGE_CLASSES: set[str] = {"GLACIER", "DEEP_ARCHIVE"}
+
+#: Default number of worker threads used for parallel copy operations.
+DEFAULT_MAX_WORKERS: int = 10
+
+#: Internal concurrency per copy operation (multipart parts in parallel).
+#: Pool size is sized to max_workers * this value so the pool never overflows.
+_TRANSFER_MAX_CONCURRENCY: int = 10
 
 # Pattern for parsing the x-amz-restore header.
 # Example: ongoing-request="false", expiry-date="Fri, 23 Dec 2012 00:00:00 GMT"
@@ -45,27 +66,54 @@ class RestoreStatus:
     requires_restore: bool  # Archived and not yet restored
 
 
+@dataclass(frozen=True)
+class _Entry:
+    """Normalized internal representation of a version or delete marker."""
+
+    key: str
+    version_id: str
+    last_modified: datetime
+    is_marker: bool
+    storage_class: str = "STANDARD"
+    size: int = 0
+
+
 class S3TimeMachine:
     """Restore S3 buckets to a specific point in time."""
+
+    bucket_name: str
+    destination_bucket: str | None
+    region: str
+    s3_client: "S3Client"
+    s3_resource: "S3ServiceResource"
 
     def __init__(
         self,
         bucket_name: str,
         region: str | None = None,
         destination_bucket: str | None = None,
-    ):
+        max_workers: int = DEFAULT_MAX_WORKERS,
+    ) -> None:
         """Initialize S3TimeMachine client.
 
         Args:
             bucket_name: Name of the source S3 bucket.
             region: AWS region (defaults to eu-west-1).
             destination_bucket: Name of the destination S3 bucket for restored objects.
+            max_workers: Number of worker threads; sets connection pool size to match.
         """
-        self.bucket_name: str = bucket_name
-        self.destination_bucket: str | None = destination_bucket
+        self.bucket_name = bucket_name
+        self.destination_bucket = destination_bucket
         self.region = region or "eu-west-1"
-        self.s3_client = boto3.client("s3", region_name=self.region)
-        self.s3_resource = boto3.resource("s3", region_name=self.region)
+        _boto_config = botocore.config.Config(
+            max_pool_connections=max_workers * _TRANSFER_MAX_CONCURRENCY
+        )
+        self.s3_client = boto3.client(
+            "s3", region_name=self.region, config=_boto_config
+        )
+        self.s3_resource = boto3.resource(
+            "s3", region_name=self.region, config=_boto_config
+        )
 
     # ---------------------------------------------------------------- bucket meta
 
@@ -75,15 +123,15 @@ class S3TimeMachine:
             response = self.s3_client.get_bucket_versioning(Bucket=self.bucket_name)
             return response.get("Status") == "Enabled"
         except Exception as e:
-            print(f"Error checking versioning: {e}")
+            logger.error("Error checking versioning: %s", e)
             return False
 
-    def get_bucket_tags(self) -> list[dict]:
+    def get_bucket_tags(self) -> list["TagTypeDef"]:
         """Fetch the source bucket's tag set. Empty list if none."""
         try:
             response = self.s3_client.get_bucket_tagging(Bucket=self.bucket_name)
             return list(response.get("TagSet", []))
-        except self.s3_client.exceptions.ClientError as e:
+        except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code == "NoSuchTagSet":
                 return []
@@ -95,19 +143,21 @@ class S3TimeMachine:
 
     # ---------------------------------------------------------------- listing
 
-    def list_object_versions(self) -> list[dict]:
+    def list_object_versions(self) -> list["ObjectVersionTypeDef"]:
         """List all object versions in the bucket (no delete markers)."""
-        versions: list[dict] = []
+        versions: list[ObjectVersionTypeDef] = []
         paginator = self.s3_client.get_paginator("list_object_versions")
         for page in paginator.paginate(Bucket=self.bucket_name):
             if "Versions" in page:
                 versions.extend(page["Versions"])
         return versions
 
-    def list_all_entries(self) -> tuple[list[dict], list[dict]]:
+    def list_all_entries(
+        self,
+    ) -> tuple[list["ObjectVersionTypeDef"], list["DeleteMarkerEntryTypeDef"]]:
         """List all versions and delete markers (paginated)."""
-        versions: list[dict] = []
-        markers: list[dict] = []
+        versions: list[ObjectVersionTypeDef] = []
+        markers: list[DeleteMarkerEntryTypeDef] = []
         paginator = self.s3_client.get_paginator("list_object_versions")
         for page in paginator.paginate(Bucket=self.bucket_name):
             versions.extend(page.get("Versions") or [])
@@ -126,31 +176,47 @@ class S3TimeMachine:
         """
         versions, markers = self.list_all_entries()
 
-        # Tag each entry with its type, then group by key.
-        by_key: dict[str, list[dict]] = {}
+        # Normalize all entries into a single typed shape, grouped by key.
+        by_key: dict[str, list[_Entry]] = {}
         for v in versions:
-            by_key.setdefault(v["Key"], []).append({**v, "_type": "version"})
+            by_key.setdefault(v["Key"], []).append(
+                _Entry(
+                    key=v["Key"],
+                    version_id=v["VersionId"],
+                    last_modified=v["LastModified"],
+                    is_marker=False,
+                    storage_class=v.get("StorageClass", "STANDARD"),
+                    size=int(v.get("Size", 0) or 0),
+                )
+            )
         for m in markers:
-            by_key.setdefault(m["Key"], []).append({**m, "_type": "marker"})
+            by_key.setdefault(m["Key"], []).append(
+                _Entry(
+                    key=m["Key"],
+                    version_id=m["VersionId"],
+                    last_modified=m["LastModified"],
+                    is_marker=True,
+                )
+            )
 
         result: list[ObjectVersionRef] = []
         for key, entries in by_key.items():
             # Only entries that existed at or before target_time matter.
-            candidates = [e for e in entries if e["LastModified"] <= target_time]
+            candidates = [e for e in entries if e.last_modified <= target_time]
             if not candidates:
                 continue
             # The "current" entry at target_time is the most recently modified one.
-            current = max(candidates, key=lambda e: e["LastModified"])
-            if current["_type"] == "marker":
+            current = max(candidates, key=lambda e: e.last_modified)
+            if current.is_marker:
                 # Object was deleted at target_time.
                 continue
             result.append(
                 ObjectVersionRef(
                     key=key,
-                    version_id=current["VersionId"],
-                    storage_class=current.get("StorageClass", "STANDARD"),
-                    last_modified=current["LastModified"],
-                    size=int(current.get("Size", 0)),
+                    version_id=current.version_id,
+                    storage_class=current.storage_class,
+                    last_modified=current.last_modified,
+                    size=current.size,
                 )
             )
         return result
@@ -257,23 +323,54 @@ class S3TimeMachine:
 
     # ---------------------------------------------------------------- copy
 
+    def _copy_one(self, ref: ObjectVersionRef, dest: str) -> ObjectVersionRef:
+        """Copy a single object version (called by worker threads)."""
+        logger.debug(
+            "Copying s3://%s/%s (version %s) to s3://%s/%s",
+            self.bucket_name,
+            ref.key,
+            ref.version_id,
+            dest,
+            ref.key,
+        )
+        self.s3_client.copy(
+            Bucket=dest,
+            Key=ref.key,
+            CopySource={
+                "Bucket": self.bucket_name,
+                "Key": ref.key,
+                "VersionId": ref.version_id,
+            },
+            Config=boto3.s3.transfer.TransferConfig(
+                max_concurrency=_TRANSFER_MAX_CONCURRENCY
+            ),
+        )
+        return ref
+
     def copy_versions_to_destination(
         self,
         refs: Iterable[ObjectVersionRef],
         destination_bucket: str | None = None,
         dry_run: bool = False,
+        max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> list[ObjectVersionRef]:
         """Copy each (key, version) into the destination bucket under the same key.
 
-        If ``dry_run`` is True, only logs the intended copies.
+        Copies are dispatched to a ``ThreadPoolExecutor`` so that multiple
+        server-side copies run in parallel. The business logic per object is
+        unchanged: exactly one ``copy`` per ref, same source/dest mapping.
+
+        If ``dry_run`` is True, only logs the intended copies and performs no
+        S3 mutations.
         """
         dest = destination_bucket or self.destination_bucket
         if not dest:
             raise ValueError("No destination bucket configured.")
 
-        copied: list[ObjectVersionRef] = []
-        for ref in refs:
-            if dry_run:
+        ref_list = list(refs)
+
+        if dry_run:
+            for ref in ref_list:
                 logger.info(
                     "[DRY RUN] Would copy s3://%s/%s (version %s) to s3://%s/%s",
                     self.bucket_name,
@@ -282,25 +379,36 @@ class S3TimeMachine:
                     dest,
                     ref.key,
                 )
-            else:
-                logger.debug(
-                    "Copying s3://%s/%s (version %s) to s3://%s/%s",
-                    self.bucket_name,
-                    ref.key,
-                    ref.version_id,
-                    dest,
-                    ref.key,
-                )
-                self.s3_client.copy(
-                    Bucket=dest,
-                    Key=ref.key,
-                    CopySource={
-                        "Bucket": self.bucket_name,
-                        "Key": ref.key,
-                        "VersionId": ref.version_id,
-                    },
-                )
-            copied.append(ref)
+            return ref_list
+
+        copied: list[ObjectVersionRef] = []
+        errors: list[tuple[ObjectVersionRef, BaseException]] = []
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures: dict[
+                concurrent.futures.Future[ObjectVersionRef], ObjectVersionRef
+            ] = {executor.submit(self._copy_one, ref, dest): ref for ref in ref_list}
+
+            for future in concurrent.futures.as_completed(futures):
+                ref = futures[future]
+                try:
+                    future.result()
+                except BaseException as exc:  # noqa: BLE001
+                    logger.error(
+                        "Failed to copy s3://%s/%s (version %s): %s",
+                        self.bucket_name,
+                        ref.key,
+                        ref.version_id,
+                        exc,
+                    )
+                    errors.append((ref, exc))
+                else:
+                    copied.append(ref)
+
+        if errors:
+            raise RuntimeError(
+                f"{len(errors)} copy operation(s) failed; first error: {errors[0][1]!r}"
+            )
         return copied
 
     # ---------------------------------------------------------------- pipeline
@@ -313,6 +421,7 @@ class S3TimeMachine:
         target_time: datetime | None = None,
         prompt: bool = True,
         dry_run: bool = False,
+        max_workers: int = DEFAULT_MAX_WORKERS,
     ) -> dict[str, Any]:
         """High-level pipeline matching the project plan.
 
@@ -325,6 +434,7 @@ class S3TimeMachine:
             prompt: Whether to interactively prompt the user.
             dry_run: If True, no S3 mutations are performed; instead the intended
                 actions are logged.
+            max_workers: Number of worker threads used for parallel copies.
 
         Returns:
             Result dict including ``status``: one of
@@ -409,13 +519,17 @@ class S3TimeMachine:
 
         # 4. Copy all versions to the destination bucket.
         logger.info(
-            "%sCopying %d object version(s) to s3://%s/ ...",
+            "%sCopying %d object version(s) to s3://%s/ using %d worker(s) ...",
             "[DRY RUN] " if dry_run else "",
             len(ready),
             dest,
+            max_workers,
         )
         copied = self.copy_versions_to_destination(
-            ready, destination_bucket=dest, dry_run=dry_run
+            ready,
+            destination_bucket=dest,
+            dry_run=dry_run,
+            max_workers=max_workers,
         )
         logger.info("Done.")
         return {
@@ -431,7 +545,7 @@ class S3TimeMachine:
 
 def _choose_timestamp(timestamps: list[datetime]) -> datetime:
     """Prompt the user to pick one timestamp from ``timestamps``."""
-    print("Available restore points (lock-until times):")
+    print("Available restore points (lock times):")
     for idx, ts in enumerate(timestamps, start=1):
         print(f"  [{idx}] {ts.isoformat()}")
     while True:
@@ -455,7 +569,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--destination-bucket", required=True, help="Destination bucket name"
     )
-    parser.add_argument("--region", default=None, help="AWS region (default us-east-1)")
+    parser.add_argument("--region", default=None, help="AWS region (default eu-west-1)")
     parser.add_argument(
         "--tier",
         choices=("Standard", "Bulk", "Expedited"),
@@ -473,7 +587,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ISO-8601 point-in-time to restore to. If omitted, the bucket's "
-            " lock tags are listed for interactive selection."
+            "lock tags are listed for interactive selection."
+        ),
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=DEFAULT_MAX_WORKERS,
+        help=(
+            "Number of worker threads used for parallel copy operations "
+            f"(default: {DEFAULT_MAX_WORKERS})."
         ),
     )
     parser.add_argument(
@@ -499,9 +622,23 @@ def _configure_logging(debug: bool) -> None:
     logger.setLevel(level)
 
 
+class _CliArgs(argparse.Namespace):
+    """Typed view of the CLI argument namespace."""
+
+    source_bucket: str
+    destination_bucket: str
+    region: str | None
+    tier: str
+    days: int
+    target_time: str | None
+    max_workers: int
+    dry_run: bool
+    debug: bool
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
-    args = _build_arg_parser().parse_args(argv)
+    args = _build_arg_parser().parse_args(argv, namespace=_CliArgs())
 
     _configure_logging(debug=args.debug)
 
@@ -516,13 +653,15 @@ def main(argv: list[str] | None = None) -> int:
         bucket_name=args.source_bucket,
         region=args.region,
         destination_bucket=args.destination_bucket,
+        max_workers=args.max_workers,
     )
     result = machine.run(
         destination_bucket=args.destination_bucket,
-        tier=args.tier,
+        tier=cast(RestoreTier, args.tier),
         days=args.days,
         target_time=target_time,
         dry_run=args.dry_run,
+        max_workers=args.max_workers,
     )
     return 0 if result["status"] in {"copied", "no-objects", "no-lock-times"} else 1
 
