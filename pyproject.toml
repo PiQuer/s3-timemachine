@@ -1,0 +1,52 @@
+[project]
+name = "s3-timemachine"
+version = "0.1.0"
+description = "A tool to restore s3 compliance-locked buckets at a specific point in time."
+authors = [
+    {name = "Raimar Sandner",email = "mail@raimar-sandner.de"}
+]
+license = "MIT License"
+requires-python = ">=3.10"
+dependencies = [
+    "boto3>=1.26.0",
+    "boto3-stubs (>=1.43.8,<2.0.0)",
+]
+
+[project.scripts]
+s3-timemachine = "s3_timemachine.main:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "flake8>=6.0",
+    "mypy>=1.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-v --cov=s3_timemachine --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.flake8]
+max-line-length = 100
+extend-ignore = ["E203", "W503"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
