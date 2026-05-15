@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("s3_timemachine")
 
-RestoreTier = Literal["Standard", "Bulk", "Expedited"]
+RestoreTier = Literal["Standard", "Bulk"]
 
 #: Storage classes that require a restore request before the object is readable.
 ARCHIVE_STORAGE_CLASSES: set[str] = {"GLACIER", "DEEP_ARCHIVE"}
@@ -442,7 +442,7 @@ class S3TimeMachine:
 
         Args:
             destination_bucket: Where restored objects will be copied to.
-            tier: Glacier restore tier ("Standard" or "Bulk", or "Expedited").
+            tier: Glacier restore tier ("Standard" or "Bulk").
             days: Retention period (days) for restored copies.
             target_time: Point-in-time to restore to. If None and ``prompt`` is True,
                 the user is offered the bucket's lock-times to choose from.
@@ -587,7 +587,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--region", default=None, help="AWS region (default eu-west-1)")
     parser.add_argument(
         "--tier",
-        choices=("Standard", "Bulk", "Expedited"),
+        choices=("Standard", "Bulk"),
         default="Standard",
         help="Glacier restore tier",
     )
