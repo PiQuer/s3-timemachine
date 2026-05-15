@@ -15,6 +15,8 @@ import boto3
 import boto3.s3.transfer
 import botocore.config
 import botocore.exceptions
+import tqdm
+import tqdm.contrib.logging
 
 from .utils import parse_iso, parse_lock_tags, select_lock_time_for_target
 
@@ -325,8 +327,8 @@ class S3TimeMachine:
 
     def _copy_one(self, ref: ObjectVersionRef, dest: str) -> ObjectVersionRef:
         """Copy a single object version (called by worker threads)."""
-        logger.debug(
-            "Copying s3://%s/%s (version %s) to s3://%s/%s",
+        logger.info(
+            "Copying s3://%s/%s (version %s) -> s3://%s/%s",
             self.bucket_name,
             ref.key,
             ref.version_id,
@@ -384,26 +386,39 @@ class S3TimeMachine:
         copied: list[ObjectVersionRef] = []
         errors: list[tuple[ObjectVersionRef, BaseException]] = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures: dict[
-                concurrent.futures.Future[ObjectVersionRef], ObjectVersionRef
-            ] = {executor.submit(self._copy_one, ref, dest): ref for ref in ref_list}
+        with tqdm.tqdm(
+            total=len(ref_list),
+            unit="obj",
+            desc="Copying",
+            dynamic_ncols=True,
+        ) as progress:
+            with tqdm.contrib.logging.logging_redirect_tqdm():
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=max_workers
+                ) as executor:
+                    futures: dict[
+                        concurrent.futures.Future[ObjectVersionRef], ObjectVersionRef
+                    ] = {
+                        executor.submit(self._copy_one, ref, dest): ref
+                        for ref in ref_list
+                    }
 
-            for future in concurrent.futures.as_completed(futures):
-                ref = futures[future]
-                try:
-                    future.result()
-                except BaseException as exc:  # noqa: BLE001
-                    logger.error(
-                        "Failed to copy s3://%s/%s (version %s): %s",
-                        self.bucket_name,
-                        ref.key,
-                        ref.version_id,
-                        exc,
-                    )
-                    errors.append((ref, exc))
-                else:
-                    copied.append(ref)
+                    for future in concurrent.futures.as_completed(futures):
+                        ref = futures[future]
+                        try:
+                            future.result()
+                        except BaseException as exc:  # noqa: BLE001
+                            logger.error(
+                                "Failed to copy s3://%s/%s (version %s): %s",
+                                self.bucket_name,
+                                ref.key,
+                                ref.version_id,
+                                exc,
+                            )
+                            errors.append((ref, exc))
+                        else:
+                            copied.append(ref)
+                        progress.update(1)
 
         if errors:
             raise RuntimeError(
