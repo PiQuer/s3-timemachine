@@ -9,6 +9,7 @@ from s3_timemachine.main import (
     ObjectVersionRef,
     RestoreStatus,
     S3TimeMachine,
+    main,
 )
 
 
@@ -508,3 +509,253 @@ def test_run_prompts_for_target_time(mock_s3_client):
     # User selected the only available lock time.
     assert result["status"] == "no-objects"
     assert result["target_time"] == lock_time
+
+
+# -------------------------------------------------------------- shorten_restore_retention
+
+
+def test_shorten_updates_available_archived_object(mock_s3_client):
+    mock_s3_client.head_object.return_value = {
+        "Restore": 'ongoing-request="false", expiry-date="Fri, 23 Dec 2099 00:00:00 GMT"'
+    }
+    ref = _ref("GLACIER")
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention([ref], days=1)
+    assert shortened == [ref]
+    assert skipped == []
+    mock_s3_client.restore_object.assert_called_once_with(
+        Bucket="src",
+        Key="k",
+        VersionId="v",
+        RestoreRequest={"Days": 1, "GlacierJobParameters": {"Tier": "Standard"}},
+    )
+
+
+def test_shorten_skips_not_yet_restored(mock_s3_client):
+    mock_s3_client.head_object.return_value = {}  # requires_restore=True
+    ref = _ref("DEEP_ARCHIVE")
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention([ref], days=1)
+    assert shortened == []
+    assert skipped == [ref]
+    mock_s3_client.restore_object.assert_not_called()
+
+
+def test_shorten_skips_ongoing_restore(mock_s3_client):
+    mock_s3_client.head_object.return_value = {"Restore": 'ongoing-request="true"'}
+    ref = _ref("GLACIER")
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention([ref], days=1)
+    assert shortened == []
+    assert skipped == [ref]
+    mock_s3_client.restore_object.assert_not_called()
+
+
+def test_shorten_skips_non_archived_object(mock_s3_client):
+    ref = _ref("STANDARD")
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention([ref], days=1)
+    assert shortened == []
+    assert skipped == [ref]
+    mock_s3_client.head_object.assert_not_called()
+    mock_s3_client.restore_object.assert_not_called()
+
+
+def test_shorten_dry_run_skips_api(mock_s3_client):
+    mock_s3_client.head_object.return_value = {
+        "Restore": 'ongoing-request="false", expiry-date="Fri, 23 Dec 2099 00:00:00 GMT"'
+    }
+    ref = _ref("GLACIER")
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention(
+        [ref], days=1, dry_run=True
+    )
+    # Dry-run: ref counted as shortened but no API call.
+    assert shortened == [ref]
+    assert skipped == []
+    mock_s3_client.restore_object.assert_not_called()
+
+
+def test_shorten_mixed_objects(mock_s3_client):
+    """Available archived → shortened; not-yet-restored archived → skipped; standard → skipped."""
+    available = _ref("GLACIER")
+    not_restored = ObjectVersionRef(
+        key="b",
+        version_id="v2",
+        storage_class="DEEP_ARCHIVE",
+        last_modified=datetime.now(timezone.utc),
+        size=0,
+    )
+    standard = ObjectVersionRef(
+        key="c",
+        version_id="v3",
+        storage_class="STANDARD",
+        last_modified=datetime.now(timezone.utc),
+        size=0,
+    )
+
+    def _head_side_effect(**kwargs):
+        if kwargs["Key"] == "k":
+            return {
+                "Restore": 'ongoing-request="false", expiry-date="Fri, 23 Dec 2099 00:00:00 GMT"'
+            }
+        return {}  # not yet restored
+
+    mock_s3_client.head_object.side_effect = _head_side_effect
+    shortened, skipped = S3TimeMachine("src").shorten_restore_retention(
+        [available, not_restored, standard], days=2
+    )
+    assert shortened == [available]
+    assert skipped == [not_restored, standard]
+    mock_s3_client.restore_object.assert_called_once()
+
+
+# -------------------------------------------------------------- run_shorten pipeline
+
+
+def test_run_shorten_no_lock_times(mock_s3_client):
+    mock_s3_client.get_bucket_tagging.return_value = {"TagSet": []}
+    result = S3TimeMachine("src").run_shorten(
+        prompt=False, target_time=datetime(2030, 1, 1, tzinfo=timezone.utc)
+    )
+    assert result["status"] == "no-lock-times"
+
+
+def test_run_shorten_no_objects(mock_s3_client):
+    _mock_lock_tags(mock_s3_client)
+    _paginator_with(versions=[], markers=[], mock_s3_client=mock_s3_client)
+    result = S3TimeMachine("src").run_shorten(
+        target_time=datetime(2030, 1, 1, tzinfo=timezone.utc), prompt=False
+    )
+    assert result["status"] == "no-objects"
+
+
+def test_run_shorten_shortens_available_objects(mock_s3_client):
+    _mock_lock_tags(mock_s3_client)
+    _paginator_with(
+        versions=[
+            {
+                "Key": "a",
+                "VersionId": "v1",
+                "LastModified": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "StorageClass": "GLACIER",
+                "Size": 1,
+            }
+        ],
+        markers=[],
+        mock_s3_client=mock_s3_client,
+    )
+    mock_s3_client.head_object.return_value = {
+        "Restore": 'ongoing-request="false", expiry-date="Fri, 23 Dec 2099 00:00:00 GMT"'
+    }
+    result = S3TimeMachine("src").run_shorten(
+        days=1,
+        target_time=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        prompt=False,
+    )
+    assert result["status"] == "shortened"
+    assert len(result["shortened"]) == 1
+    assert result["skipped"] == []
+    mock_s3_client.restore_object.assert_called_once()
+    mock_s3_client.copy.assert_not_called()
+
+
+def test_run_shorten_skips_not_restored(mock_s3_client):
+    _mock_lock_tags(mock_s3_client)
+    _paginator_with(
+        versions=[
+            {
+                "Key": "a",
+                "VersionId": "v1",
+                "LastModified": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "StorageClass": "DEEP_ARCHIVE",
+                "Size": 1,
+            }
+        ],
+        markers=[],
+        mock_s3_client=mock_s3_client,
+    )
+    mock_s3_client.head_object.return_value = {}  # not yet restored
+    result = S3TimeMachine("src").run_shorten(
+        days=1,
+        target_time=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        prompt=False,
+    )
+    assert result["status"] == "shortened"
+    assert result["shortened"] == []
+    assert len(result["skipped"]) == 1
+    mock_s3_client.restore_object.assert_not_called()
+
+
+def test_run_shorten_dry_run(mock_s3_client):
+    _mock_lock_tags(mock_s3_client)
+    _paginator_with(
+        versions=[
+            {
+                "Key": "a",
+                "VersionId": "v1",
+                "LastModified": datetime(2024, 1, 1, tzinfo=timezone.utc),
+                "StorageClass": "GLACIER",
+                "Size": 1,
+            }
+        ],
+        markers=[],
+        mock_s3_client=mock_s3_client,
+    )
+    mock_s3_client.head_object.return_value = {
+        "Restore": 'ongoing-request="false", expiry-date="Fri, 23 Dec 2099 00:00:00 GMT"'
+    }
+    result = S3TimeMachine("src").run_shorten(
+        days=1,
+        target_time=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        prompt=False,
+        dry_run=True,
+    )
+    assert result["status"] == "shortened"
+    assert result["dry_run"] is True
+    assert len(result["shortened"]) == 1
+    mock_s3_client.restore_object.assert_not_called()
+
+
+# -------------------------------------------------------------- CLI subcommands
+
+
+def test_main_restore_subcommand(mock_s3_client):
+    mock_s3_client.get_bucket_tagging.return_value = {"TagSet": []}
+    rc = main(
+        [
+            "restore",
+            "--source-bucket",
+            "src",
+            "--destination-bucket",
+            "dst",
+            "--target-time",
+            "2030-01-01T00:00:00Z",
+        ]
+    )
+    assert rc == 0
+
+
+def test_main_shorten_subcommand(mock_s3_client):
+    mock_s3_client.get_bucket_tagging.return_value = {"TagSet": []}
+    rc = main(
+        [
+            "shorten",
+            "--source-bucket",
+            "src",
+            "--target-time",
+            "2030-01-01T00:00:00Z",
+        ]
+    )
+    assert rc == 0
+
+
+def test_main_shorten_has_no_destination_bucket(mock_s3_client):
+    """shorten must not accept --destination-bucket."""
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "shorten",
+                "--source-bucket",
+                "src",
+                "--destination-bucket",
+                "dst",
+                "--target-time",
+                "2030-01-01T00:00:00Z",
+            ]
+        )

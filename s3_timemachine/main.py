@@ -426,6 +426,93 @@ class S3TimeMachine:
             )
         return copied
 
+    def shorten_restore_retention(
+        self,
+        refs: Iterable[ObjectVersionRef],
+        days: int,
+        dry_run: bool = False,
+    ) -> tuple[list[ObjectVersionRef], list[ObjectVersionRef]]:
+        """Update the restore-window expiry on already-restored archived objects.
+
+        Only objects whose restore is already *complete* (``available=True``) are
+        updated.  Objects still being restored (``ongoing``) or not yet restored
+        (``requires_restore``) are skipped — this method never initiates a new
+        restore.  Non-archived objects are also skipped (they have no restore window).
+
+        Args:
+            refs: Object versions to process.
+            days: New restore-window length in days, starting from now.
+            dry_run: If True, only log the intended actions; make no API calls.
+
+        Returns:
+            ``(shortened, skipped)`` — refs whose window was updated vs. refs
+            left untouched.
+        """
+        shortened: list[ObjectVersionRef] = []
+        skipped: list[ObjectVersionRef] = []
+        for ref in refs:
+            if ref.storage_class not in ARCHIVE_STORAGE_CLASSES:
+                logger.debug(
+                    "Skipping s3://%s/%s (version %s): not archived (class %s)",
+                    self.bucket_name,
+                    ref.key,
+                    ref.version_id,
+                    ref.storage_class,
+                )
+                skipped.append(ref)
+                continue
+            status = self.get_restore_status(ref)
+            if not status.available:
+                logger.warning(
+                    (
+                        "Skipping s3://%s/%s (version %s, class %s): "
+                        "not yet restored (ongoing=%s, requires_restore=%s) — "
+                        "run 'restore' first."
+                    ),
+                    self.bucket_name,
+                    ref.key,
+                    ref.version_id,
+                    ref.storage_class,
+                    status.ongoing,
+                    status.requires_restore,
+                )
+                skipped.append(ref)
+                continue
+            if dry_run:
+                logger.info(
+                    (
+                        "[DRY RUN] Would shorten restore window to %dd for "
+                        "s3://%s/%s (version %s)"
+                    ),
+                    days,
+                    self.bucket_name,
+                    ref.key,
+                    ref.version_id,
+                )
+                shortened.append(ref)
+                continue
+            logger.info(
+                "Shortening restore window to %dd for s3://%s/%s (version %s)",
+                days,
+                self.bucket_name,
+                ref.key,
+                ref.version_id,
+            )
+            self.s3_client.restore_object(
+                Bucket=self.bucket_name,
+                Key=ref.key,
+                VersionId=ref.version_id,
+                RestoreRequest={
+                    "Days": days,
+                    # GlacierJobParameters is required by the API for archived
+                    # objects even when updating an existing restore.  The tier
+                    # has no effect on an already-completed retrieval job.
+                    "GlacierJobParameters": {"Tier": "Standard"},
+                },
+            )
+            shortened.append(ref)
+        return shortened, skipped
+
     # ---------------------------------------------------------------- pipeline
 
     def run(
@@ -554,6 +641,98 @@ class S3TimeMachine:
             "dry_run": dry_run,
         }
 
+    def run_shorten(
+        self,
+        days: int = 1,
+        target_time: datetime | None = None,
+        prompt: bool = True,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Shorten the restore window of already-restored archived objects.
+
+        Discovers the same object versions as :meth:`run` would at the chosen
+        lock time, but instead of copying them it only updates the restore
+        expiry of objects that are currently available.  Objects that have not
+        yet been restored are skipped — no new restore is ever initiated.
+
+        This is useful when objects were restored with a long retention window
+        and you want to stop paying for Standard-storage billing early.
+
+        Args:
+            days: New restore-window length in days (typically ``1`` to expire
+                the temporary copy as soon as possible).
+            target_time: Point-in-time to use for version selection.  If None
+                and ``prompt`` is True, the user is offered lock-times to pick.
+            prompt: Whether to interactively prompt the user.
+            dry_run: If True, no S3 mutations are performed.
+
+        Returns:
+            Result dict including ``status``: one of
+            ``"shortened" | "no-lock-times" | "no-objects"``.
+        """
+        if dry_run:
+            logger.info("Dry-run mode enabled — no S3 mutations will occur.")
+
+        # 1. Determine target lock time (same logic as run()).
+        lock_times = self.get_lock_times()
+        if not lock_times:
+            logger.info("No non-expired lock times found in bucket tags.")
+            return {"status": "no-lock-times"}
+
+        if target_time is not None:
+            if target_time.tzinfo is None:
+                target_time = target_time.replace(tzinfo=timezone.utc)
+            chosen = select_lock_time_for_target(lock_times, target_time)
+            if chosen is None:
+                logger.error(
+                    "No lock time found at or before %s. Available: %s",
+                    target_time.isoformat(),
+                    ", ".join(t.isoformat() for t in lock_times),
+                )
+                return {"status": "no-lock-times"}
+            logger.info(
+                "Selected lock time %s (closest at or before %s).",
+                chosen.isoformat(),
+                target_time.isoformat(),
+            )
+            target_time = chosen
+        else:
+            if not prompt:
+                raise ValueError("target_time required when prompt=False")
+            target_time = _choose_timestamp(lock_times)
+
+        if target_time.tzinfo is None:
+            target_time = target_time.replace(tzinfo=timezone.utc)
+
+        logger.info(
+            "Determining object versions current at %s ...", target_time.isoformat()
+        )
+
+        # 2. Versions current at the chosen time.
+        refs = self.versions_at(target_time)
+        if not refs:
+            logger.info("No object versions existed at the requested point in time.")
+            return {"status": "no-objects", "target_time": target_time}
+
+        logger.info("Found %d object versions.", len(refs))
+
+        # 3. Shorten restore window; never initiate new restores.
+        shortened, skipped = self.shorten_restore_retention(
+            refs, days=days, dry_run=dry_run
+        )
+        logger.info(
+            "Done. %d object(s) updated, %d skipped.",
+            len(shortened),
+            len(skipped),
+        )
+        return {
+            "status": "shortened",
+            "target_time": target_time,
+            "shortened": shortened,
+            "skipped": skipped,
+            "dry_run": dry_run,
+        }
+
 
 # -------------------------------------------------------------------- helpers
 
@@ -578,52 +757,81 @@ def _choose_timestamp(timestamps: list[datetime]) -> datetime:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="s3-timemachine",
-        description="Restore a versioned S3 bucket to a point in time.",
+        description="Restore or manage a versioned S3 bucket at a point in time.",
     )
-    parser.add_argument("--source-bucket", required=True, help="Source bucket name")
-    parser.add_argument(
-        "--destination-bucket", required=True, help="Destination bucket name"
+    sub = parser.add_subparsers(dest="subcommand", metavar="COMMAND")
+    sub.required = True
+
+    def _add_common(p: argparse.ArgumentParser) -> None:
+        """Arguments shared by every subcommand."""
+        p.add_argument("--source-bucket", required=True, help="Source bucket name.")
+        p.add_argument("--region", default=None, help="AWS region (default eu-west-1).")
+        p.add_argument(
+            "--target-time",
+            default=None,
+            help=(
+                "ISO-8601 point-in-time. If omitted, lock tags are listed "
+                "for interactive selection."
+            ),
+        )
+        p.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="Do not modify any S3 state; only log what would be done.",
+        )
+        p.add_argument(
+            "--debug",
+            action="store_true",
+            help="Enable debug-level logging.",
+        )
+
+    # ---- restore subcommand ------------------------------------------------
+    restore_p = sub.add_parser(
+        "restore",
+        help="Restore bucket objects to a point in time by copying to a destination.",
     )
-    parser.add_argument("--region", default=None, help="AWS region (default eu-west-1)")
-    parser.add_argument(
+    _add_common(restore_p)
+    restore_p.add_argument(
+        "--destination-bucket", required=True, help="Destination bucket name."
+    )
+    restore_p.add_argument(
         "--tier",
         choices=("Standard", "Bulk"),
         default="Standard",
-        help="Glacier restore tier",
+        help="Glacier restore tier (default: Standard).",
     )
-    parser.add_argument(
+    restore_p.add_argument(
         "--days",
         type=int,
         default=7,
-        help="Retention period (days) for the restored copies",
+        help="Glacier restore-window length in days (default: 7).",
     )
-    parser.add_argument(
-        "--target-time",
-        default=None,
-        help=(
-            "ISO-8601 point-in-time to restore to. If omitted, the bucket's "
-            "lock tags are listed for interactive selection."
-        ),
-    )
-    parser.add_argument(
+    restore_p.add_argument(
         "--max-workers",
         type=int,
         default=DEFAULT_MAX_WORKERS,
         help=(
-            "Number of worker threads used for parallel copy operations "
+            "Number of worker threads for parallel copy operations "
             f"(default: {DEFAULT_MAX_WORKERS})."
         ),
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Do not modify any S3 state; only log what would be done.",
+
+    # ---- shorten subcommand ------------------------------------------------
+    shorten_p = sub.add_parser(
+        "shorten",
+        help=(
+            "Shorten the restore window of already-restored objects to reduce "
+            "Standard-storage billing. Never initiates a new restore."
+        ),
     )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug-level logging.",
+    _add_common(shorten_p)
+    shorten_p.add_argument(
+        "--days",
+        type=int,
+        default=1,
+        help=("New restore-window length in days (default: 1, i.e. expire ASAP)."),
     )
+
     return parser
 
 
@@ -637,23 +845,35 @@ def _configure_logging(debug: bool) -> None:
     logger.setLevel(level)
 
 
-class _CliArgs(argparse.Namespace):
-    """Typed view of the CLI argument namespace."""
+class _CommonArgs(argparse.Namespace):
+    """Arguments present on every subcommand."""
 
+    subcommand: str
     source_bucket: str
-    destination_bucket: str
     region: str | None
-    tier: str
-    days: int
     target_time: str | None
-    max_workers: int
     dry_run: bool
     debug: bool
 
 
+class _RestoreArgs(_CommonArgs):
+    """Arguments specific to the ``restore`` subcommand."""
+
+    destination_bucket: str
+    tier: str
+    days: int
+    max_workers: int
+
+
+class _ShortenArgs(_CommonArgs):
+    """Arguments specific to the ``shorten`` subcommand."""
+
+    days: int
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point."""
-    args = _build_arg_parser().parse_args(argv, namespace=_CliArgs())
+    args = _build_arg_parser().parse_args(argv, namespace=_CommonArgs())
 
     _configure_logging(debug=args.debug)
 
@@ -664,21 +884,40 @@ def main(argv: list[str] | None = None) -> int:
             logger.error("Invalid --target-time: %r", args.target_time)
             return 2
 
-    machine = S3TimeMachine(
-        bucket_name=args.source_bucket,
-        region=args.region,
-        destination_bucket=args.destination_bucket,
-        max_workers=args.max_workers,
-    )
-    result = machine.run(
-        destination_bucket=args.destination_bucket,
-        tier=cast(RestoreTier, args.tier),
-        days=args.days,
-        target_time=target_time,
-        dry_run=args.dry_run,
-        max_workers=args.max_workers,
-    )
-    return 0 if result["status"] in {"copied", "no-objects", "no-lock-times"} else 1
+    if args.subcommand == "restore":
+        rargs = cast(_RestoreArgs, args)
+        machine = S3TimeMachine(
+            bucket_name=rargs.source_bucket,
+            region=rargs.region,
+            destination_bucket=rargs.destination_bucket,
+            max_workers=rargs.max_workers,
+        )
+        result = machine.run(
+            destination_bucket=rargs.destination_bucket,
+            tier=cast(RestoreTier, rargs.tier),
+            days=rargs.days,
+            target_time=target_time,
+            dry_run=rargs.dry_run,
+            max_workers=rargs.max_workers,
+        )
+        return 0 if result["status"] in {"copied", "no-objects", "no-lock-times"} else 1
+
+    if args.subcommand == "shorten":
+        sargs = cast(_ShortenArgs, args)
+        machine = S3TimeMachine(
+            bucket_name=sargs.source_bucket,
+            region=sargs.region,
+        )
+        result = machine.run_shorten(
+            days=sargs.days,
+            target_time=target_time,
+            dry_run=sargs.dry_run,
+        )
+        return (
+            0 if result["status"] in {"shortened", "no-objects", "no-lock-times"} else 1
+        )
+
+    return 1  # unreachable; satisfies type checkers
 
 
 if __name__ == "__main__":  # pragma: no cover
