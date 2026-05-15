@@ -291,7 +291,7 @@ class S3TimeMachine:
                     dest,
                     ref.key,
                 )
-                self.s3_client.copy_object(
+                self.s3_client.copy(
                     Bucket=dest,
                     Key=ref.key,
                     CopySource={

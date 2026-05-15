@@ -272,7 +272,7 @@ def test_copy_versions_to_destination(mock_s3_client):
     ref = _ref()
     copied = machine.copy_versions_to_destination([ref])
     assert copied == [ref]
-    mock_s3_client.copy_object.assert_called_once_with(
+    mock_s3_client.copy.assert_called_once_with(
         Bucket="dst",
         Key="k",
         CopySource={"Bucket": "src", "Key": "k", "VersionId": "v"},
@@ -374,7 +374,7 @@ def test_run_copies_when_all_available(mock_s3_client):
     assert len(result["copied"]) == 1
     # target_time in result is the selected lock time, not the raw arg.
     assert result["target_time"] == _LOCK_TIME
-    mock_s3_client.copy_object.assert_called_once()
+    mock_s3_client.copy.assert_called_once()
 
 
 def test_run_pending_when_archive_not_ready(mock_s3_client):
@@ -401,7 +401,7 @@ def test_run_pending_when_archive_not_ready(mock_s3_client):
     assert result["status"] == "pending"
     assert len(result["pending"]) == 1
     mock_s3_client.restore_object.assert_called_once()
-    mock_s3_client.copy_object.assert_not_called()
+    mock_s3_client.copy.assert_not_called()
 
 
 def test_run_dry_run_no_mutations(mock_s3_client):
@@ -436,7 +436,7 @@ def test_run_dry_run_no_mutations(mock_s3_client):
     assert result["status"] == "pending"
     # No mutating calls in dry-run mode.
     mock_s3_client.restore_object.assert_not_called()
-    mock_s3_client.copy_object.assert_not_called()
+    mock_s3_client.copy.assert_not_called()
 
 
 def test_run_dry_run_copies_logged_not_executed(mock_s3_client):
@@ -462,7 +462,7 @@ def test_run_dry_run_copies_logged_not_executed(mock_s3_client):
     assert result["status"] == "copied"
     assert result["dry_run"] is True
     assert len(result["copied"]) == 1
-    mock_s3_client.copy_object.assert_not_called()
+    mock_s3_client.copy.assert_not_called()
 
 
 def test_initiate_restore_dry_run_skips_api(mock_s3_client):
@@ -475,7 +475,7 @@ def test_copy_versions_dry_run_skips_api(mock_s3_client):
     machine = S3TimeMachine("src", destination_bucket="dst")
     copied = machine.copy_versions_to_destination([_ref()], dry_run=True)
     assert len(copied) == 1
-    mock_s3_client.copy_object.assert_not_called()
+    mock_s3_client.copy.assert_not_called()
 
 
 def test_run_no_objects(mock_s3_client):
