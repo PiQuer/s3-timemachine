@@ -2,7 +2,9 @@
 
 Restore a versioned S3 bucket to a specific point in time.
 
-Given a source bucket with [versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) enabled and a set of *lock tags* that record when snapshots were taken (e.g., by applying compliance locks on all current versions of the bucket), `s3-timemachine` identifies which object version was current at that moment and copies it into a destination bucket — effectively rewinding the bucket to that instant.
+Given a source bucket with [versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) enabled and a set of *lock tags* that record when "snapshots" were taken, `s3-timemachine` identifies which object version was current at that moment and copies it into a destination bucket — effectively rewinding the bucket to that instant.
+
+In the context of this tool, a *snapshot* is a custom implementation rather than a native AWS S3 feature. It refers to a rolling object lock applied to all current object versions within a bucket at regular intervals. You must set up this mechanism yourself; see the [AWS Lambda Setup Guide](./AWS_LAMBDA_SETUP.md) for inspiration on how to automate this process. Once applied, these snapshots ensure that even if objects are subsequently deleted — whether through normal operations or malicious activity — the historical versions remain intact and locked. This preserves a consistent, point-in-time picture of your bucket's state until the lock retention periods expire and non-current versions are permanently removed by S3 lifecycle rules.
 
 A second `shorten` sub-command lets you cut short the restore window of objects that were previously thawed from Glacier storage, stopping unnecessary Standard-storage billing without touching anything else.
 

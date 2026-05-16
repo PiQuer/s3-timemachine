@@ -85,9 +85,9 @@ Your Lambda execution role needs these permissions:
         "s3:GetBucketTagging"
       ],
       "Resource": [
-        "arn:aws:s3:::my-source-bucket",
-        "arn:aws:s3:::my-backup-bucket-1",
-        "arn:aws:s3:::my-backup-bucket-2"
+        "arn:aws:s3:::my-source-bucket-1",
+        "arn:aws:s3:::my-source-bucket-2",
+        "arn:aws:s3:::my-source-bucket-3"
       ]
     },
     {
@@ -96,9 +96,9 @@ Your Lambda execution role needs these permissions:
         "s3:PutObjectRetention"
       ],
       "Resource": [
-        "arn:aws:s3:::my-source-bucket/*",
-        "arn:aws:s3:::my-backup-bucket-1/*",
-        "arn:aws:s3:::my-backup-bucket-2/*"
+        "arn:aws:s3:::my-source-bucket-1/*",
+        "arn:aws:s3:::my-source-bucket-2/*",
+        "arn:aws:s3:::my-source-bucket-3/*"
       ]
     },
     {
@@ -115,7 +115,7 @@ Your Lambda execution role needs these permissions:
 }
 ```
 
-Replace `my-source-bucket`, `my-backup-bucket-1`, `my-backup-bucket-2` with your actual bucket names. Make sure to enable versioning and object locking on your buckets.
+Replace `my-source-bucket-1`, `my-source-bucket-2`, `my-source-bucket-3` with your actual bucket names. Make sure to enable versioning and object locking on your buckets.
 
 ---
 
@@ -186,6 +186,7 @@ Watch for uploads of a specific file (e.g. `rolling_lock_trigger`) in your bucke
 - On-demand: you control when locks are created
 - Can be triggered manually by uploading a file
 - Flexible: supports multiple buckets via the same Lambda
+- Audit-proof timestamp metadata: The marker file and its version history serve as an independent, tamper-evident record of when snapshots occurred. Even if a malicious actor successfully deletes the bucket tags (the snapshot metadata), you only lose the retention period information — the precise historical timeline of when snapshots were taken remains securely preserved via the marker file's history.
 
 **Setup:**
 
